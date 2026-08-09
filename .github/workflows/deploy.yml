@@ -1,0 +1,129 @@
+name: Deploy
+# ---------------------------------------------------------------------------
+# MIRROR of brave/leo .github/workflows/deploy.yml
+# (real file: `on: workflow_run [workflows:[Build], types:[completed]]`,
+#  privileged perms, downloads artifact `build` via dawidd6/action-download-artifact
+#  with run_id + allow_forks:false, then `aws s3 sync` to the nala S3 bucket.)
+#
+# Preserved VERBATIM (these are the two links under test):
+#   * the workflow_run trigger (runs in BASE repo, with base secrets/write token)
+#   * env PR_NUMBER = github.event.workflow_run.pull_requests[0].number   <- LINK 2
+#   * the download step: dawidd6/action-download-artifact@09f2f74 (v3.1.4)
+#         run_id: github.event.workflow_run.id + allow_forks: false      <- LINK 1
+#
+# Replaced with a SAFE proof step:
+#   * the real `aws s3 sync . s3://$BUCKET/ --delete` is COMMENTED OUT
+#   * we instead print the PR_NUMBER, the branch that WOULD run (root vs pr-prefix),
+#     and `cat` the downloaded canary to prove the fork's bytes reached this job.
+# ---------------------------------------------------------------------------
+on:
+  workflow_run:
+    workflows: ['Build']
+    types:
+      - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # real leo: mints OIDC token -> assumes AWS_ROLE_ARN
+      actions: read
+      contents: read
+      pull-requests: write
+    # NOTE: real leo deploy.yml pins `environment: name: staging`. That environment
+    # holds the AWS/S3 secrets and MAY carry required-reviewer protection (see
+    # EVIDENCE.md "Open question #1"). For this self-owned PoC we omit `environment:`
+    # so the privileged job runs without an org-side gate you cannot reproduce.
+    env:
+      # ===== LINK 2 verbatim (brave/leo deploy.yml:24) =====
+      # For a FORK-originated workflow_run, pull_requests[] is EMPTY, so this
+      # renders to the empty string -> PR_NUMBER="".
+      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      # In real leo this is a secret; unused by the safe proof, literal for the mock.
+      S3_BUCKET_NAME: poc-mock-nala-bucket
+      # Attacker-influenced event fields are read into env (the SAFE pattern) so the
+      # proof step below references "$VAR" instead of inlining ${{ }} into the shell.
+      WR_ID: ${{ github.event.workflow_run.id }}
+      WR_EVENT: ${{ github.event.workflow_run.event }}
+      HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+      BASE_REPO: ${{ github.event.workflow_run.repository.full_name }}
+      PRS_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+
+    steps:
+      # ===== LINK 1 verbatim (brave/leo deploy.yml:28-36) =====
+      # Same pinned SHA, same inputs. Because run_id is supplied, the action's
+      # fork-skip check (main.js:134, guarded by `if (!runID)` at main.js:115) is
+      # never reached -> allow_forks:false is a NO-OP and the FORK artifact downloads.
+      - name: Download artifact
+        id: download-artifact
+        uses: dawidd6/action-download-artifact@09f2f74827fd3a8607589e5ad7f9398816f540fe # v3.1.4
+        with:
+          workflow_conclusion: success
+          run_id: ${{ github.event.workflow_run.id }}
+          name: build
+          path: artifact
+          allow_forks: false
+
+      - name: Prove the chain (SAFE — replaces the real `aws s3 sync`)
+        env:
+          AWS_REGION: us-west-2
+        run: |
+          set -xeEo pipefail
+
+          echo "::group::workflow_run event facts"
+          echo "workflow_run.id           = ${WR_ID}"
+          echo "workflow_run.event        = ${WR_EVENT}"
+          echo "head_repository.full_name = ${HEAD_REPO}"
+          echo "repository.full_name      = ${BASE_REPO}"
+          echo "pull_requests (raw JSON)  = ${PRS_JSON}"
+          echo "PR_NUMBER (=pull_requests[0].number) = '${PR_NUMBER}'"
+          echo "::endgroup::"
+
+          # ---------------- LINK 2 : empty PR_NUMBER -> ROOT sync ----------------
+          echo "::group::LINK 2 — branch selection"
+          if [[ -z ${PR_NUMBER} ]]; then
+            echo "RESULT: PR_NUMBER is EMPTY  ->  ROOT-SYNC branch is taken"
+            echo "REAL SINK that would run: aws s3 sync . s3://\${S3_BUCKET_NAME}/ --delete   (bucket ROOT)"
+            SELECTED_BRANCH="root-sync (bucket root)"
+          else
+            echo "RESULT: PR_NUMBER='${PR_NUMBER}'  ->  per-PR-prefix branch is taken"
+            echo "REAL SINK that would run: aws s3 sync . s3://\${S3_BUCKET_NAME}/pr-${PR_NUMBER}/ --delete"
+            SELECTED_BRANCH="pr-${PR_NUMBER} prefix"
+          fi
+          echo "SELECTED_BRANCH = ${SELECTED_BRANCH}"
+          echo "::endgroup::"
+
+          # ---------------- LINK 1 : fork bytes reached this privileged job ------
+          echo "::group::LINK 1 — downloaded artifact tree + canary content"
+          ls -R ./artifact
+          echo "---- canary (attacker-controlled bytes built by the FORK PR) ----"
+          cat ./artifact/storybook-static/index.html
+          echo "-----------------------------------------------------------------"
+          # match the stable prefix so this holds even after the fork edits the suffix
+          if grep -q 'POC-CANARY-STORED-XSS' ./artifact/storybook-static/index.html; then
+            echo "PROVEN: fork-authored stored-XSS canary is present in the deploy job's working tree."
+          else
+            echo "canary NOT found — check the fork actually rebuilt index.html"; exit 1
+          fi
+          echo "::endgroup::"
+
+          # =====================================================================
+          # REAL SINK — commented out. DO NOT enable against any Brave asset.
+          # To run a full-fidelity PoC, point S3_BUCKET_NAME at a RESEARCHER-OWNED
+          # throwaway bucket and uncomment. (Not required — the prints above prove
+          # the mechanics: attacker bytes + root-sync selection.)
+          #
+          #   cd ./artifact/storybook-static
+          #   aws configure set default.s3.max_concurrent_requests 200
+          #   aws configure set default.s3.max_queue_size 10000
+          #   if [[ -z ${PR_NUMBER} ]]; then   # non-PR / fork -> ROOT
+          #     aws s3 sync . "s3://${S3_BUCKET_NAME}/" --delete --exclude 'pr-*/*' --exclude '*.old.css' --exclude '*.diff'
+          #   else
+          #     aws s3 sync . "s3://${S3_BUCKET_NAME}/pr-${PR_NUMBER}/commit-${HEAD_SHA}/" --delete --exclude '*.old.css' --exclude '*.diff'
+          #     aws s3 sync . "s3://${S3_BUCKET_NAME}/pr-${PR_NUMBER}/" --delete --exclude 'commit-*/*' --exclude '*.old.css' --exclude '*.diff'
+          #   fi
+          # =====================================================================
