@@ -66,6 +66,3 @@ jobs:
             ./storybook-static
             ./tokens/css/variables*.diff
             ./tokens/css/file-sizes.diff
-
-
-# fork-controlled change
